@@ -13,6 +13,7 @@ from typing import Dict, Any, Tuple, List, Optional, Union, Callable
 import time
 import argparse
 import json
+import io
 from datetime import datetime
 
 import torch
@@ -23,6 +24,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from datasets import Dataset, DatasetDict
 from tqdm import tqdm
+import wandb
 
 # Use relative imports when running as a module
 try:
@@ -246,7 +248,8 @@ def train_epoch(
     optimizer: optim.Optimizer,
     device: str,
     epoch: int,
-    log_interval: int = 10
+    log_interval: int = 10,
+    log_to_wandb: bool = False
 ) -> float:
     """Train the model for one epoch.
     
@@ -292,6 +295,10 @@ def train_epoch(
         # Update progress bar
         pbar.set_postfix({'loss': loss.item()})
         
+        # Log batch loss to wandb
+        if log_to_wandb:
+            wandb.log({"batch_loss": loss.item(), "batch": batch_idx + (epoch-1) * len(train_loader)})
+        
     # Calculate average loss
     avg_loss = total_loss / len(train_loader)
     
@@ -303,7 +310,9 @@ def validate(
     val_loader: DataLoader,
     criterion: nn.Module,
     device: str,
-    visualize_path: Optional[Path] = None
+    visualize_path: Optional[Path] = None,
+    log_to_wandb: bool = False,
+    epoch: Optional[int] = None
 ) -> Tuple[float, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Validate the model on the validation set.
     
@@ -358,6 +367,35 @@ def validate(
             sample_target.cpu(),
             save_path=visualize_path
         )
+        
+    # Log to wandb if enabled
+    if log_to_wandb and sample_input is not None and epoch is not None:
+        # Create a figure for wandb
+        fig = plt.figure(figsize=(15, 5))
+        
+        # Plot input image
+        plt.subplot(1, 3, 1)
+        plt.imshow(tensor_to_image(sample_input[0].cpu()))
+        plt.title("Input (Dirty)")
+        plt.axis('off')
+        
+        # Plot output image
+        plt.subplot(1, 3, 2)
+        plt.imshow(tensor_to_image(sample_output[0].cpu()))
+        plt.title("Output (Cleaned)")
+        plt.axis('off')
+        
+        # Plot target image
+        plt.subplot(1, 3, 3)
+        plt.imshow(tensor_to_image(sample_target[0].cpu()))
+        plt.title("Target (Clean)")
+        plt.axis('off')
+        
+        plt.tight_layout()
+        
+        # Log to wandb
+        wandb.log({f"validation_images_epoch_{epoch}": wandb.Image(fig)})
+        plt.close(fig)
     
     return avg_loss, sample_input, sample_output, sample_target
 
@@ -443,7 +481,9 @@ def train_model(
     checkpoint_dir: Path,
     log_dir: Path,
     log_interval: int = 1,
-    early_stopping_patience: int = 10
+    early_stopping_patience: int = 10,
+    log_to_wandb: bool = False,
+    experiment_name: str = "autoencoder"
 ) -> Autoencoder:
     """Train the autoencoder model.
     
@@ -473,6 +513,23 @@ def train_model(
     train_losses = []
     val_losses = []
     
+    # Initialize wandb if enabled
+    if log_to_wandb:
+        wandb.init(
+            project="document-cleaning-autoencoder",
+            name=experiment_name,
+            config={
+                "epochs": num_epochs,
+                "batch_size": train_loader.batch_size,
+                "learning_rate": optimizer.param_groups[0]['lr'],
+                "early_stopping_patience": early_stopping_patience,
+                "device": device,
+                "model_type": model.__class__.__name__,
+            }
+        )
+        # Log model architecture
+        wandb.watch(model, log="all")
+    
     # Start training
     print(f"Starting training for {num_epochs} epochs...")
     start_time = time.time()
@@ -486,7 +543,8 @@ def train_model(
             optimizer=optimizer,
             device=device,
             epoch=epoch,
-            log_interval=log_interval
+            log_interval=log_interval,
+            log_to_wandb=log_to_wandb
         )
         train_losses.append(train_loss)
         
@@ -496,12 +554,24 @@ def train_model(
             val_loader=val_loader,
             criterion=criterion,
             device=device,
-            visualize_path=log_dir / f"val_epoch_{epoch}.png"
+            visualize_path=log_dir / f"val_epoch_{epoch}.png",
+            log_to_wandb=log_to_wandb,
+            epoch=epoch
         )
         val_losses.append(val_loss)
         
         # Print progress
         print(f"Epoch {epoch}/{num_epochs}, Train Loss: {train_loss:.6f}, Val Loss: {val_loss:.6f}")
+        
+        # Log metrics to wandb
+        if log_to_wandb:
+            wandb.log({
+                "epoch": epoch,
+                "train_loss": train_loss,
+                "val_loss": val_loss,
+                "best_val_loss": best_val_loss if val_loss > best_val_loss else val_loss,
+                "patience_counter": patience_counter
+            })
         
         # Check if this is the best model
         is_best = val_loss < best_val_loss
@@ -556,6 +626,17 @@ def train_model(
     if best_model_path.exists():
         model, _, _, _ = load_checkpoint(model, None, best_model_path)
         print(f"Loaded best model from {best_model_path}")
+        
+    # Finish wandb run
+    if log_to_wandb:
+        # Log the best model as an artifact
+        if best_model_path.exists():
+            artifact = wandb.Artifact(f"model-{wandb.run.id}", type="model")
+            artifact.add_file(str(best_model_path))
+            wandb.log_artifact(artifact)
+        
+        # Close wandb run
+        wandb.finish()
     
     return model
 
@@ -599,6 +680,12 @@ def parse_args():
                         help="How often to log and validate (in epochs)")
     parser.add_argument("--resume", type=str, default=None,
                         help="Path to checkpoint to resume from")
+    
+    # Weights & Biases arguments
+    parser.add_argument("--wandb", action="store_true",
+                        help="Enable Weights & Biases logging")
+    parser.add_argument("--wandb-project", type=str, default="document-cleaning-autoencoder",
+                        help="Weights & Biases project name")
     
     return parser.parse_args()
 
@@ -676,7 +763,9 @@ def main():
         checkpoint_dir=checkpoint_dir,
         log_dir=log_dir,
         log_interval=args.log_interval,
-        early_stopping_patience=args.early_stopping
+        early_stopping_patience=args.early_stopping,
+        log_to_wandb=args.wandb,
+        experiment_name=args.experiment_name
     )
     
     print(f"Training completed. Results saved to {experiment_dir}")
