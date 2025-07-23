@@ -1,0 +1,42 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*.so
+*.dylib
+
+# Virtual environments
+.venv/
+.env
+
+# OS files
+.DS_Store
+*.egg-info
+*.egg
+*.spec
+*.mo
+*.pot
+*.log
+*.db
+*.sqlite
+*.db-journal
+*.sqlite-journal
+*.pypackage
+*.egg-info/PKG-INFO
+*.egg-info/SOURCES.txt
+*.egg-info/dependency_links.txt
+*.egg-info/requires.txt
+*.egg-info/top_level.txt
+*.egg-info/entry_points.txt
+*.egg-info/not-zip-safe
+*.egg-info/namespace_packages.txt
+
+# Model checkpoints / weights
+checkpoints/
+*.pt
+*.pth
+*.bin
+*.ckpt
+
+# Datasets and large artifacts (keep demo small files)
+data/
+!data/demo/**

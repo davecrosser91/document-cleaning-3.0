@@ -1,0 +1,42 @@
+[tool.pytest.ini_options]
+pythonpath = [
+    "src"
+]
+
+[tool.pyright]
+include = ["src"]
+stubPath= ""
+typeCheckingMode = "basic"
+venvPath = "."
+venv = ".venv/"
+
+[project]
+description = "A package offering document cleaning."
+readme = "README.md"
+dynamic = ["version"]
+name = "document_cleaning_3"
+dependencies = [
+    "pandas>=2.3.0",
+    "torch>=2.2.0",
+    "transformers>=4.40.0",
+    "Pillow>=10.3.0",
+    "torchvision>=0.18.0",
+    "requests>=2.32.0",
+    "datasets>=2.19.0",
+    "pydantic>=2.11.7",
+    "matplotlib>=3.10.3",
+    "pymupdf>=1.26.3",
+]
+requires-python = ">=3.13"
+authors = [
+    { name = "David Kreuzer" },
+]
+
+[dependency-groups]
+dev = [
+    "pyright>=1.1.401",
+    "pytest==8.3.4",
+]
+
+[tool.uv]
+index-strategy = "unsafe-best-match" #TODO: Wegmachen
