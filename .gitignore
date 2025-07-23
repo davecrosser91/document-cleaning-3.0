@@ -40,3 +40,6 @@ checkpoints/
 # Datasets and large artifacts (keep demo small files)
 data/
 !data/demo/**
+.windsurf
+results
+src.lock

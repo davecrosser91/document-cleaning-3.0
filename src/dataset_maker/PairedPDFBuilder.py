@@ -137,7 +137,10 @@ class PairedPDFBuilder(datasets.GeneratorBasedBuilder):
             datasets.SplitGenerator(name="train", gen_kwargs={"data_root": cfg.data_root}),
         ]
 
-    def _generate_examples(self, data_root: Path) -> Iterable[Tuple[int, Dict]]:
+    def _generate_examples(self, **kwargs) -> Iterable[Tuple[int, Dict]]:
+        data_root = kwargs.get('data_root')
+        if not isinstance(data_root, Path):
+            raise ValueError(f"Expected data_root to be a Path object, got {type(data_root)}")
         clean_dir, dirty_dir = data_root / _CLEAN_DIR, data_root / _DIRTY_DIR
         clean_basenames = {p.stem for p in clean_dir.glob("*.pdf")}
 

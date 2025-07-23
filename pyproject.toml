@@ -3,13 +3,6 @@ pythonpath = [
     "src"
 ]
 
-[tool.pyright]
-include = ["src"]
-stubPath= ""
-typeCheckingMode = "basic"
-venvPath = "."
-venv = ".venv/"
-
 [project]
 description = "A package offering document cleaning."
 readme = "README.md"
