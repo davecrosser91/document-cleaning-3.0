@@ -1,0 +1,686 @@
+"""
+Script to train the autoencoder model for document cleaning.
+
+This script provides functionality to:
+1. Load the paired PDF dataset
+2. Initialize the autoencoder model
+3. Train the model on the dataset
+4. Save checkpoints and visualize results during training
+5. Evaluate the model on a validation set
+"""
+from pathlib import Path
+from typing import Dict, Any, Tuple, List, Optional, Union, Callable
+import time
+import argparse
+import json
+from datetime import datetime
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader
+import numpy as np
+import matplotlib.pyplot as plt
+from datasets import Dataset, DatasetDict
+from tqdm import tqdm
+
+# Use relative imports when running as a module
+try:
+    from src.dataset_maker.PairedPDFBuilder import PairedPDFBuilder
+    from src.models.autoencoder import create_autoencoder, Autoencoder, AutoencoderConfig
+# Use direct imports when running the script directly
+except ModuleNotFoundError:
+    from dataset_maker.PairedPDFBuilder import PairedPDFBuilder
+    from models.autoencoder import create_autoencoder, Autoencoder, AutoencoderConfig
+
+
+def load_dataset(data_root: Path, val_split: float = 0.1) -> Tuple[Dataset, Dataset]:
+    """Load the paired PDF dataset and split into train/val.
+    
+    Args:
+        data_root: Path to the dataset root directory
+        val_split: Fraction of data to use for validation
+        
+    Returns:
+        Tuple of (train_dataset, val_dataset)
+    """
+    # Initialize the builder with the data root
+    builder = PairedPDFBuilder(name="default", data_root=data_root)
+    
+    # Prepare the dataset (skip if already prepared)
+    try:
+        # Try to load the dataset without rebuilding
+        dataset = builder.as_dataset(split="train")
+        print(f"Dataset loaded: {len(dataset)} examples")
+    except Exception as e:
+        print(f"Error loading dataset: {e}")
+        print("Rebuilding dataset...")
+        builder.download_and_prepare(download_mode="force_redownload")
+        dataset = builder.as_dataset(split="train")
+        print(f"Dataset rebuilt and loaded: {len(dataset)} examples")
+    
+    # Split into train and validation sets
+    dataset = dataset.shuffle(seed=42)
+    val_size = int(len(dataset) * val_split)
+    train_size = len(dataset) - val_size
+    
+    train_dataset = dataset.select(range(train_size))
+    val_dataset = dataset.select(range(train_size, len(dataset)))
+    
+    print(f"Train dataset: {len(train_dataset)} examples")
+    print(f"Validation dataset: {len(val_dataset)} examples")
+    
+    return train_dataset, val_dataset
+
+
+def collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Union[torch.Tensor, List[Any]]]:
+    """Custom collate function to handle the conversion to tensors.
+    
+    Args:
+        batch: List of dataset items
+        
+    Returns:
+        Dictionary of batched tensors
+    """
+    clean_images = torch.tensor(np.stack([item['clean_image'] for item in batch])).float()
+    dirty_images = torch.tensor(np.stack([item['dirty_image'] for item in batch])).float()
+    
+    # Normalize images to [0, 1] if they aren't already
+    if clean_images.max() > 1.0:
+        clean_images = clean_images / 255.0
+    if dirty_images.max() > 1.0:
+        dirty_images = dirty_images / 255.0
+        
+    return {
+        'clean_image': clean_images,
+        'dirty_image': dirty_images,
+        'dirt_type': torch.tensor([item['dirt_type'] for item in batch]),
+        'clean_file': [item['clean_file'] for item in batch],
+        'dirty_file': [item['dirty_file'] for item in batch]
+    }
+
+
+def prepare_dataloader(dataset: Dataset, batch_size: int = 4, shuffle: bool = True) -> DataLoader:
+    """Prepare a DataLoader for the dataset.
+    
+    Args:
+        dataset: The dataset to load
+        batch_size: Batch size for the DataLoader
+        shuffle: Whether to shuffle the dataset
+        
+    Returns:
+        DataLoader for the dataset
+    """
+    # Create the DataLoader
+    dataloader = DataLoader(  # pyright: ignore[reportGeneralTypeIssues]
+        dataset, 
+        batch_size=batch_size, 
+        shuffle=shuffle,
+        collate_fn=collate_fn,
+        num_workers=2,
+        pin_memory=True
+    )
+    
+    return dataloader
+
+
+def initialize_model(
+    input_height: int, 
+    input_width: int,
+    config: Optional[AutoencoderConfig] = None,
+    device: str = "cpu"
+) -> Autoencoder:
+    """Initialize the autoencoder model.
+    
+    Args:
+        input_height: Height of input images
+        input_width: Width of input images
+        config: Optional custom configuration for the autoencoder
+        device: Device to run the model on ('cpu' or 'cuda')
+        
+    Returns:
+        Initialized autoencoder model
+    """
+    # Create the autoencoder with default parameters or custom config
+    if config is None:
+        model = create_autoencoder(
+            input_channels=3,
+            output_channels=3,
+            hidden_dims=[16, 32, 64, 128],  # Deeper network for better cleaning
+            latent_dim=256,  # Larger latent space for better representation
+            input_height=input_height,
+            input_width=input_width
+        )
+    else:
+        model = Autoencoder(
+            config=config,
+            input_height=input_height,
+            input_width=input_width
+        )
+    
+    # Move model to device
+    model = model.to(device)
+    
+    return model
+
+
+def tensor_to_image(tensor: torch.Tensor) -> np.ndarray:
+    """Convert a tensor to a numpy image.
+    
+    Args:
+        tensor: Input tensor of shape [C, H, W]
+        
+    Returns:
+        Numpy array of shape [H, W, C] with values in [0, 1]
+    """
+    # Convert to numpy and transpose from [C, H, W] to [H, W, C]
+    image = tensor.detach().cpu().numpy().transpose(1, 2, 0)
+    
+    # Ensure values are in [0, 1]
+    image = np.clip(image, 0, 1)
+    
+    return image
+
+
+def visualize_batch(
+    input_images: torch.Tensor,
+    output_images: torch.Tensor,
+    target_images: torch.Tensor,
+    num_samples: int = 4,
+    save_path: Optional[Path] = None
+) -> None:
+    """Visualize a batch of images (input, output, target).
+    
+    Args:
+        input_images: Input (dirty) images tensor [B, C, H, W]
+        output_images: Output images from the autoencoder [B, C, H, W]
+        target_images: Target (clean) images tensor [B, C, H, W]
+        num_samples: Number of samples to visualize
+        save_path: Optional path to save the visualization
+    """
+    # Ensure save directory exists
+    if save_path is not None:
+        save_path.parent.mkdir(exist_ok=True, parents=True)
+    
+    # Limit number of samples to batch size
+    num_samples = min(num_samples, input_images.size(0))
+    
+    # Create a grid of images
+    fig, axes = plt.subplots(num_samples, 3, figsize=(15, 5 * num_samples))
+    
+    # If only one sample, wrap axes in a list to make it iterable
+    if num_samples == 1:
+        axes = [axes]
+    
+    # Plot each sample
+    for i in range(num_samples):
+        # Input image
+        axes[i][0].imshow(tensor_to_image(input_images[i]))
+        axes[i][0].set_title("Input (Dirty)")
+        axes[i][0].axis('off')
+        
+        # Output image
+        axes[i][1].imshow(tensor_to_image(output_images[i]))
+        axes[i][1].set_title("Output (Cleaned)")
+        axes[i][1].axis('off')
+        
+        # Target image
+        axes[i][2].imshow(tensor_to_image(target_images[i]))
+        axes[i][2].set_title("Target (Clean)")
+        axes[i][2].axis('off')
+    
+    plt.tight_layout()
+    
+    # Save the figure if a path is provided
+    if save_path is not None:
+        plt.savefig(save_path, dpi=300)
+        print(f"Visualization saved to {save_path}")
+    
+    plt.close(fig)
+
+
+def train_epoch(
+    model: Autoencoder,
+    train_loader: DataLoader,
+    criterion: nn.Module,
+    optimizer: optim.Optimizer,
+    device: str,
+    epoch: int,
+    log_interval: int = 10
+) -> float:
+    """Train the model for one epoch.
+    
+    Args:
+        model: The autoencoder model
+        train_loader: DataLoader for training data
+        criterion: Loss function
+        optimizer: Optimizer
+        device: Device to run on
+        epoch: Current epoch number
+        log_interval: How often to log progress
+        
+    Returns:
+        Average training loss for the epoch
+    """
+    model.train()
+    total_loss = 0.0
+    
+    # Use tqdm for progress bar
+    pbar = tqdm(enumerate(train_loader), total=len(train_loader), desc=f"Epoch {epoch}")
+    
+    for batch_idx, batch in pbar:
+        # Get data
+        dirty_images = batch['dirty_image'].to(device)
+        clean_images = batch['clean_image'].to(device)
+        
+        # Zero gradients
+        optimizer.zero_grad()
+        
+        # Forward pass
+        outputs = model(dirty_images)
+        
+        # Calculate loss
+        loss = criterion(outputs, clean_images)
+        
+        # Backward pass and optimize
+        loss.backward()
+        optimizer.step()
+        
+        # Update total loss
+        total_loss += loss.item()
+        
+        # Update progress bar
+        pbar.set_postfix({'loss': loss.item()})
+        
+    # Calculate average loss
+    avg_loss = total_loss / len(train_loader)
+    
+    return avg_loss
+
+
+def validate(
+    model: Autoencoder,
+    val_loader: DataLoader,
+    criterion: nn.Module,
+    device: str,
+    visualize_path: Optional[Path] = None
+) -> Tuple[float, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Validate the model on the validation set.
+    
+    Args:
+        model: The autoencoder model
+        val_loader: DataLoader for validation data
+        criterion: Loss function
+        device: Device to run on
+        visualize_path: Optional path to save visualizations
+        
+    Returns:
+        Tuple of (average validation loss, sample input images, 
+                 sample output images, sample target images)
+    """
+    model.eval()
+    total_loss = 0.0
+    
+    # Store a batch for visualization
+    sample_input = None
+    sample_output = None
+    sample_target = None
+    
+    with torch.no_grad():
+        for batch_idx, batch in enumerate(val_loader):
+            # Get data
+            dirty_images = batch['dirty_image'].to(device)
+            clean_images = batch['clean_image'].to(device)
+            
+            # Forward pass
+            outputs = model(dirty_images)
+            
+            # Calculate loss
+            loss = criterion(outputs, clean_images)
+            
+            # Update total loss
+            total_loss += loss.item()
+            
+            # Store first batch for visualization
+            if batch_idx == 0:
+                sample_input = dirty_images
+                sample_output = outputs
+                sample_target = clean_images
+    
+    # Calculate average loss
+    avg_loss = total_loss / len(val_loader)
+    
+    # Visualize results if path is provided
+    if visualize_path is not None and sample_input is not None:
+        visualize_batch(
+            sample_input.cpu(),
+            sample_output.cpu(),
+            sample_target.cpu(),
+            save_path=visualize_path
+        )
+    
+    return avg_loss, sample_input, sample_output, sample_target
+
+
+def save_checkpoint(
+    model: Autoencoder,
+    optimizer: optim.Optimizer,
+    epoch: int,
+    loss: float,
+    checkpoint_dir: Path,
+    is_best: bool = False
+) -> None:
+    """Save a model checkpoint.
+    
+    Args:
+        model: The autoencoder model
+        optimizer: The optimizer
+        epoch: Current epoch
+        loss: Current loss
+        checkpoint_dir: Directory to save checkpoints
+        is_best: Whether this is the best model so far
+    """
+    # Create checkpoint directory if it doesn't exist
+    checkpoint_dir.mkdir(exist_ok=True, parents=True)
+    
+    # Create checkpoint
+    checkpoint = {
+        'epoch': epoch,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'loss': loss
+    }
+    
+    # Save checkpoint
+    checkpoint_path = checkpoint_dir / f"checkpoint_epoch_{epoch}.pt"
+    torch.save(checkpoint, checkpoint_path)
+    print(f"Checkpoint saved to {checkpoint_path}")
+    
+    # Save best model if this is the best
+    if is_best:
+        best_path = checkpoint_dir / "best_model.pt"
+        torch.save(checkpoint, best_path)
+        print(f"Best model saved to {best_path}")
+
+
+def load_checkpoint(
+    model: Autoencoder,
+    optimizer: Optional[optim.Optimizer],
+    checkpoint_path: Path
+) -> Tuple[Autoencoder, Optional[optim.Optimizer], int, float]:
+    """Load a model checkpoint.
+    
+    Args:
+        model: The autoencoder model
+        optimizer: The optimizer (can be None for inference only)
+        checkpoint_path: Path to the checkpoint
+        
+    Returns:
+        Tuple of (model, optimizer, epoch, loss)
+    """
+    # Load checkpoint
+    checkpoint = torch.load(checkpoint_path)
+    
+    # Load model state
+    model.load_state_dict(checkpoint['model_state_dict'])
+    
+    # Load optimizer state if provided
+    if optimizer is not None:
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    
+    # Return model, optimizer, epoch, and loss
+    return model, optimizer, checkpoint['epoch'], checkpoint['loss']
+
+
+def train_model(
+    model: Autoencoder,
+    train_loader: DataLoader,
+    val_loader: DataLoader,
+    criterion: nn.Module,
+    optimizer: optim.Optimizer,
+    device: str,
+    num_epochs: int,
+    checkpoint_dir: Path,
+    log_dir: Path,
+    log_interval: int = 1,
+    early_stopping_patience: int = 10
+) -> Autoencoder:
+    """Train the autoencoder model.
+    
+    Args:
+        model: The autoencoder model
+        train_loader: DataLoader for training data
+        val_loader: DataLoader for validation data
+        criterion: Loss function
+        optimizer: Optimizer
+        device: Device to run on
+        num_epochs: Number of epochs to train for
+        checkpoint_dir: Directory to save checkpoints
+        log_dir: Directory to save logs and visualizations
+        log_interval: How often to log and validate
+        early_stopping_patience: Number of epochs to wait for improvement before stopping
+        
+    Returns:
+        Trained model
+    """
+    # Create directories
+    checkpoint_dir.mkdir(exist_ok=True, parents=True)
+    log_dir.mkdir(exist_ok=True, parents=True)
+    
+    # Initialize variables for tracking progress
+    best_val_loss = float('inf')
+    patience_counter = 0
+    train_losses = []
+    val_losses = []
+    
+    # Start training
+    print(f"Starting training for {num_epochs} epochs...")
+    start_time = time.time()
+    
+    for epoch in range(1, num_epochs + 1):
+        # Train for one epoch
+        train_loss = train_epoch(
+            model=model,
+            train_loader=train_loader,
+            criterion=criterion,
+            optimizer=optimizer,
+            device=device,
+            epoch=epoch,
+            log_interval=log_interval
+        )
+        train_losses.append(train_loss)
+        
+        # Validate
+        val_loss, sample_input, sample_output, sample_target = validate(
+            model=model,
+            val_loader=val_loader,
+            criterion=criterion,
+            device=device,
+            visualize_path=log_dir / f"val_epoch_{epoch}.png"
+        )
+        val_losses.append(val_loss)
+        
+        # Print progress
+        print(f"Epoch {epoch}/{num_epochs}, Train Loss: {train_loss:.6f}, Val Loss: {val_loss:.6f}")
+        
+        # Check if this is the best model
+        is_best = val_loss < best_val_loss
+        if is_best:
+            best_val_loss = val_loss
+            patience_counter = 0
+        else:
+            patience_counter += 1
+        
+        # Save checkpoint
+        save_checkpoint(
+            model=model,
+            optimizer=optimizer,
+            epoch=epoch,
+            loss=val_loss,
+            checkpoint_dir=checkpoint_dir,
+            is_best=is_best
+        )
+        
+        # Early stopping
+        if patience_counter >= early_stopping_patience:
+            print(f"Early stopping after {epoch} epochs without improvement.")
+            break
+        
+        # Save training history
+        history = {
+            'train_losses': train_losses,
+            'val_losses': val_losses,
+            'epochs': list(range(1, epoch + 1))
+        }
+        with open(log_dir / "training_history.json", 'w') as f:
+            json.dump(history, f)
+        
+        # Plot losses
+        plt.figure(figsize=(10, 5))
+        plt.plot(history['epochs'], history['train_losses'], label='Train Loss')
+        plt.plot(history['epochs'], history['val_losses'], label='Val Loss')
+        plt.xlabel('Epoch')
+        plt.ylabel('Loss')
+        plt.title('Training and Validation Loss')
+        plt.legend()
+        plt.grid(True)
+        plt.savefig(log_dir / "loss_plot.png")
+        plt.close()
+    
+    # Calculate training time
+    total_time = time.time() - start_time
+    print(f"Training completed in {total_time:.2f} seconds.")
+    
+    # Load best model
+    best_model_path = checkpoint_dir / "best_model.pt"
+    if best_model_path.exists():
+        model, _, _, _ = load_checkpoint(model, None, best_model_path)
+        print(f"Loaded best model from {best_model_path}")
+    
+    return model
+
+
+def parse_args():
+    """Parse command line arguments."""
+    parser = argparse.ArgumentParser(description="Train an autoencoder for document cleaning")
+    
+    # Dataset arguments
+    parser.add_argument("--data-root", type=str, default="src/dataset_maker/data",
+                        help="Path to the dataset root directory")
+    parser.add_argument("--val-split", type=float, default=0.1,
+                        help="Fraction of data to use for validation")
+    
+    # Training arguments
+    parser.add_argument("--batch-size", type=int, default=4,
+                        help="Batch size for training")
+    parser.add_argument("--num-epochs", type=int, default=50,
+                        help="Number of epochs to train for")
+    parser.add_argument("--lr", type=float, default=0.001,
+                        help="Learning rate")
+    parser.add_argument("--early-stopping", type=int, default=10,
+                        help="Patience for early stopping")
+    
+    # Model arguments
+    parser.add_argument("--hidden-dims", type=int, nargs="+", default=[16, 32, 64, 128],
+                        help="Hidden dimensions for each layer")
+    parser.add_argument("--latent-dim", type=int, default=256,
+                        help="Dimension of the latent space")
+    
+    # Output arguments
+    parser.add_argument("--output-dir", type=str, default="results",
+                        help="Directory to save results")
+    parser.add_argument("--experiment-name", type=str, default=None,
+                        help="Name of the experiment (default: timestamp)")
+    
+    # Miscellaneous
+    parser.add_argument("--seed", type=int, default=42,
+                        help="Random seed")
+    parser.add_argument("--log-interval", type=int, default=1,
+                        help="How often to log and validate (in epochs)")
+    parser.add_argument("--resume", type=str, default=None,
+                        help="Path to checkpoint to resume from")
+    
+    return parser.parse_args()
+
+
+def main():
+    """Main training function."""
+    # Parse arguments
+    args = parse_args()
+    
+    # Set random seed
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
+    
+    # Set device
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Using device: {device}")
+    
+    # Create experiment name if not provided
+    if args.experiment_name is None:
+        args.experiment_name = f"autoencoder_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    
+    # Create output directories
+    output_dir = Path(args.output_dir)
+    experiment_dir = output_dir / args.experiment_name
+    checkpoint_dir = experiment_dir / "checkpoints"
+    log_dir = experiment_dir / "logs"
+    
+    # Load dataset
+    data_root = Path(args.data_root)
+    train_dataset, val_dataset = load_dataset(data_root, args.val_split)
+    
+    # Prepare DataLoaders
+    train_loader = prepare_dataloader(train_dataset, args.batch_size, shuffle=True)
+    val_loader = prepare_dataloader(val_dataset, args.batch_size, shuffle=False)
+    
+    # Get a batch to determine image dimensions
+    print("Loading a batch from the dataset...")
+    batch = next(iter(train_loader))
+    
+    # Extract images and get dimensions
+    dirty_images = batch['dirty_image']
+    _, _, height, width = dirty_images.shape
+    print(f"Using actual image dimensions: {height}x{width}")
+    
+    # Initialize model
+    model = initialize_model(
+        input_height=height,
+        input_width=width,
+        device=device
+    )
+    
+    # Define loss function and optimizer
+    criterion = nn.MSELoss()
+    optimizer = optim.Adam(model.parameters(), lr=args.lr)
+    
+    # Resume from checkpoint if provided
+    start_epoch = 1
+    if args.resume is not None:
+        resume_path = Path(args.resume)
+        if resume_path.exists():
+            model, optimizer, start_epoch, _ = load_checkpoint(model, optimizer, resume_path)
+            print(f"Resumed from checkpoint: {resume_path}")
+        else:
+            print(f"Checkpoint not found: {resume_path}")
+    
+    # Train model
+    model = train_model(
+        model=model,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        criterion=criterion,
+        optimizer=optimizer,
+        device=device,
+        num_epochs=args.num_epochs,
+        checkpoint_dir=checkpoint_dir,
+        log_dir=log_dir,
+        log_interval=args.log_interval,
+        early_stopping_patience=args.early_stopping
+    )
+    
+    print(f"Training completed. Results saved to {experiment_dir}")
+
+
+if __name__ == "__main__":
+    main()
