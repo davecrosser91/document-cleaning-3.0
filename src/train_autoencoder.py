@@ -32,10 +32,15 @@ import wandb
 try:
     from src.dataset_maker.PairedPDFBuilder import PairedPDFBuilder
     from src.models.autoencoder import create_autoencoder, Autoencoder, AutoencoderConfig
+    from src.models.swinir import create_swinir_model, SwinIR, SwinIRConfig
 # Use direct imports when running the script directly
 except ModuleNotFoundError:
     from dataset_maker.PairedPDFBuilder import PairedPDFBuilder
     from models.autoencoder import create_autoencoder, Autoencoder, AutoencoderConfig
+    from models.swinir import create_swinir_model, SwinIR, SwinIRConfig
+
+# Define a type alias for our model types
+ModelType = Union[Autoencoder, SwinIR]
 
 
 def load_dataset(data_root: Path, val_split: float = 0.1) -> Tuple[Dataset, Dataset]:
@@ -166,38 +171,52 @@ def prepare_dataloader(dataset: Dataset, batch_size: int = 4, shuffle: bool = Tr
 def initialize_model(
     input_height: int, 
     input_width: int,
-    config: Optional[AutoencoderConfig] = None,
+    model_type: str = "autoencoder",
+    autoencoder_config: Optional[AutoencoderConfig] = None,
+    swinir_config: Optional[SwinIRConfig] = None,
     device: str = "cpu"
-) -> Autoencoder:
-    """Initialize the autoencoder model.
+) -> ModelType:
+    """Initialize the model.
     
     Args:
         input_height: Height of input images
         input_width: Width of input images
-        config: Optional custom configuration for the autoencoder
+        model_type: Type of model to use ('autoencoder' or 'swinir')
+        autoencoder_config: Optional custom configuration for the autoencoder
+        swinir_config: Optional custom configuration for SwinIR
         device: Device to run the model on ('cpu' or 'cuda')
         
     Returns:
-        Initialized autoencoder model
+        Initialized model
     """
-    # Create the autoencoder with default parameters or custom config
-    if config is None:
+    print(f"Initializing {model_type} model...")
+    
+    # Create model based on type
+    if model_type.lower() == "autoencoder":
         model = create_autoencoder(
-            input_channels=3,
-            output_channels=3,
-            hidden_dims=[16, 32, 64, 128],  # Deeper network for better cleaning
-            latent_dim=256,  # Larger latent space for better representation
             input_height=input_height,
-            input_width=input_width
+            input_width=input_width,
+            config=autoencoder_config
+        )
+    elif model_type.lower() == "swinir":
+        # Use 3-channel input to match our dataset
+        # Use actual input dimensions instead of square size
+        model = create_swinir_model(
+            img_size=(input_height, input_width),  # Use actual rectangular dimensions
+            in_chans=3,  # RGB images (3 channels)
+            out_chans=3,  # RGB output (3 channels)
+            window_size=8,  # Standard window size
+            embed_dim=96,  # Embedding dimension
+            depths=[6, 6, 6, 6],  # Default depths for moderate-sized model
+            num_heads=[6, 6, 6, 6],  # Default number of heads
+            use_checkpoint=True  # Use checkpointing to save memory
         )
     else:
-        model = Autoencoder(
-            config=config,
-            input_height=input_height,
-            input_width=input_width
-        )
+        raise ValueError(f"Unknown model type: {model_type}. Choose 'autoencoder' or 'swinir'")
     
-    # Move model to device
+    print(f"Model parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
+    
+    # Move to device
     model = model.to(device)
     
     return model
@@ -279,7 +298,7 @@ def visualize_batch(
 
 
 def train_epoch(
-    model: Autoencoder,
+    model: ModelType,
     train_loader: DataLoader,
     criterion: nn.Module,
     optimizer: optim.Optimizer,
@@ -364,7 +383,7 @@ def train_epoch(
 
 
 def validate(
-    model: Autoencoder,
+    model: ModelType,
     val_loader: DataLoader,
     criterion: nn.Module,
     device: str,
@@ -459,7 +478,7 @@ def validate(
 
 
 def save_checkpoint(
-    model: Autoencoder,
+    model: ModelType,
     optimizer: optim.Optimizer,
     epoch: int,
     loss: float,
@@ -500,10 +519,10 @@ def save_checkpoint(
 
 
 def load_checkpoint(
-    model: Autoencoder,
+    model: ModelType,
     optimizer: Optional[optim.Optimizer],
     checkpoint_path: Path
-) -> Tuple[Autoencoder, Optional[optim.Optimizer], int, float]:
+) -> Tuple[ModelType, Optional[optim.Optimizer], int, float]:
     """Load a model checkpoint.
     
     Args:
@@ -529,7 +548,7 @@ def load_checkpoint(
 
 
 def train_model(
-    model: Autoencoder,
+    model: ModelType,
     train_loader: DataLoader,
     val_loader: DataLoader,
     criterion: nn.Module,
@@ -542,11 +561,11 @@ def train_model(
     early_stopping_patience: int = 10,
     log_to_wandb: bool = False,
     experiment_name: str = "autoencoder"
-) -> Autoencoder:
-    """Train the autoencoder model.
+) -> ModelType:
+    """Train the model.
     
     Args:
-        model: The autoencoder model
+        model: The model (autoencoder or SwinIR)
         train_loader: DataLoader for training data
         val_loader: DataLoader for validation data
         criterion: Loss function
@@ -554,9 +573,11 @@ def train_model(
         device: Device to run on
         num_epochs: Number of epochs to train for
         checkpoint_dir: Directory to save checkpoints
-        log_dir: Directory to save logs and visualizations
-        log_interval: How often to log and validate
-        early_stopping_patience: Number of epochs to wait for improvement before stopping
+        log_dir: Directory to save logs
+        log_interval: How often to log (in epochs)
+        early_stopping_patience: Early stopping patience
+        log_to_wandb: Whether to log to Weights & Biases
+        experiment_name: Name of the experiment
         
     Returns:
         Trained model
@@ -721,10 +742,16 @@ def parse_args():
                         help="Patience for early stopping")
     
     # Model arguments
+    parser.add_argument("--model-type", type=str, default="autoencoder", choices=["autoencoder", "swinir"],
+                        help="Type of model to use (autoencoder or swinir)")
     parser.add_argument("--hidden-dims", type=int, nargs="+", default=[16, 32, 64, 128],
-                        help="Hidden dimensions for each layer")
+                        help="Hidden dimensions for each layer (autoencoder only)")
     parser.add_argument("--latent-dim", type=int, default=256,
-                        help="Dimension of the latent space")
+                        help="Dimension of the latent space (autoencoder only)")
+    parser.add_argument("--window-size", type=int, default=8,
+                        help="Window size for SwinIR (swinir only)")
+    parser.add_argument("--embed-dim", type=int, default=96, 
+                        help="Embedding dimension for SwinIR (swinir only)")
     
     # Output arguments
     parser.add_argument("--output-dir", type=str, default="results",
@@ -743,7 +770,7 @@ def parse_args():
     # Weights & Biases arguments
     parser.add_argument("--wandb", action="store_true",
                         help="Enable Weights & Biases logging")
-    parser.add_argument("--wandb-project", type=str, default="document-cleaning-autoencoder",
+    parser.add_argument("--wandb-project", type=str, default="document-cleaning",
                         help="Weights & Biases project name")
     
     return parser.parse_args()
@@ -764,7 +791,7 @@ def main():
     
     # Create experiment name if not provided
     if args.experiment_name is None:
-        args.experiment_name = f"autoencoder_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        args.experiment_name = f"{args.model_type}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     
     # Create output directories
     output_dir = Path(args.output_dir)
@@ -790,11 +817,32 @@ def main():
     print(f"Using actual image dimensions: {height}x{width}")
     
     # Initialize model
-    model = initialize_model(
-        input_height=height,
-        input_width=width,
-        device=device
-    )
+    if args.model_type == "autoencoder":
+        # Create autoencoder config if using autoencoder
+        autoencoder_config = AutoencoderConfig(
+            input_channels=1,  # Using grayscale
+            output_channels=1,
+            hidden_dims=args.hidden_dims,
+            latent_dim=args.latent_dim
+        )
+        model = initialize_model(
+            input_height=height,
+            input_width=width,
+            model_type=args.model_type,
+            autoencoder_config=autoencoder_config,
+            device=device
+        )
+    else:  # swinir
+        # Use the command line arguments for SwinIR
+        model = initialize_model(
+            input_height=height,
+            input_width=width,
+            model_type=args.model_type,
+            swinir_config=None,  # Using the defaults in initialize_model
+            device=device
+        )
+        
+    print(f"Using {args.model_type} model with {sum(p.numel() for p in model.parameters() if p.requires_grad):,} parameters")
     
     # Define loss function and optimizer
     criterion = nn.MSELoss()

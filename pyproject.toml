@@ -21,6 +21,7 @@ dependencies = [
     "pymupdf>=1.26.3",
     "python-dotenv>=1.1.1",
     "wandb>=0.21.0",
+    "einops>=0.8.1",
 ]
 requires-python = ">=3.13"
 authors = [
