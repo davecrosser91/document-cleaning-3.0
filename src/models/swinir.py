@@ -75,8 +75,8 @@ def window_partition(x: torch.Tensor, window_size: int) -> torch.Tensor:
         x = torch.nn.functional.pad(x, (0, 0, 0, pad_w, 0, pad_h))
         _, H, W, _ = x.shape
     
-    x = x.view(B, H // window_size, window_size, W // window_size, window_size, C)
-    windows = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(-1, window_size, window_size, C)
+    x = x.reshape(B, H // window_size, window_size, W // window_size, window_size, C)
+    windows = x.permute(0, 1, 3, 2, 4, 5).contiguous().reshape(-1, window_size, window_size, C)
     return windows
 
 
@@ -99,8 +99,8 @@ def window_reverse(windows: torch.Tensor, window_size: int, H: int, W: int) -> t
     W_pad = W + pad_w
     
     B = int(windows.shape[0] / (H_pad * W_pad / window_size / window_size))
-    x = windows.view(B, H_pad // window_size, W_pad // window_size, window_size, window_size, -1)
-    x = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(B, H_pad, W_pad, -1)
+    x = windows.reshape(B, H_pad // window_size, W_pad // window_size, window_size, window_size, -1)
+    x = x.permute(0, 1, 3, 2, 4, 5).contiguous().reshape(B, H_pad, W_pad, -1)
     
     # Remove padding to get back to original dimensions
     if pad_h > 0 or pad_w > 0:
@@ -397,7 +397,7 @@ class SwinTransformerBlock(nn.Module):
 
         shortcut = x
         x = self.norm1(x)
-        x = x.view(B, H, W, C)
+        x = x.reshape(B, H, W, C)
 
         # cyclic shift
         if self.shift_size > 0:
@@ -407,13 +407,13 @@ class SwinTransformerBlock(nn.Module):
 
         # partition windows
         x_windows = window_partition(shifted_x, self.window_size)  # nW*B, window_size, window_size, C
-        x_windows = x_windows.view(-1, self.window_size * self.window_size, C)  # nW*B, window_size*window_size, C
+        x_windows = x_windows.reshape(-1, self.window_size * self.window_size, C)  # nW*B, window_size*window_size, C
 
         # W-MSA/SW-MSA
         attn_windows = self.attn(x_windows, mask=self.attn_mask)  # nW*B, window_size*window_size, C
 
         # merge windows
-        attn_windows = attn_windows.view(-1, self.window_size, self.window_size, C)
+        attn_windows = attn_windows.reshape(-1, self.window_size, self.window_size, C)
         shifted_x = window_reverse(attn_windows, self.window_size, H, W)  # B H' W' C
 
         # reverse cyclic shift
@@ -421,7 +421,7 @@ class SwinTransformerBlock(nn.Module):
             x = torch.roll(shifted_x, shifts=(self.shift_size, self.shift_size), dims=(1, 2))
         else:
             x = shifted_x
-        x = x.view(B, H * W, C)
+        x = x.reshape(B, H * W, C)
 
         # FFN
         x = shortcut + self.drop_path(x)
@@ -536,7 +536,7 @@ class PatchUnEmbed(nn.Module):
             Unembedded tensor with shape (B, C, H, W)
         """
         B, HW, C = x.shape
-        x = x.transpose(1, 2).view(B, self.embed_dim, x_size[0], x_size[1])  # B C H W
+        x = x.transpose(1, 2).reshape(B, self.embed_dim, x_size[0], x_size[1])  # B C H W
         return x
 
 
