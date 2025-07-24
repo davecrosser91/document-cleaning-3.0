@@ -120,16 +120,23 @@ def collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Union[torch.Tensor, Lis
     clean_images = torch.stack(clean_images_list)
     dirty_images = torch.stack(dirty_images_list)
     
-    # Resize images to half resolution for faster training
+    # Resize images to target dimensions for training
     import torch.nn.functional as F
     
-    # Get current dimensions
-    _, _, H, W = clean_images.shape
-    target_H, target_W = H // 2, W // 2
+    # Target dimensions (half of original 2480x1754)
+    target_H, target_W = 1240, 877
     
-    # Resize both clean and dirty images
-    clean_images = F.interpolate(clean_images, size=(target_H, target_W), mode='bilinear', align_corners=False)
-    dirty_images = F.interpolate(dirty_images, size=(target_H, target_W), mode='bilinear', align_corners=False)
+    # Get current dimensions and check if resizing is needed
+    _, _, H, W = clean_images.shape
+    if H != target_H or W != target_W:
+        print(f"Resizing images from {H}x{W} to {target_H}x{target_W}")
+        # Resize both clean and dirty images
+        clean_images = F.interpolate(clean_images, size=(target_H, target_W), mode='bilinear', align_corners=False)
+        dirty_images = F.interpolate(dirty_images, size=(target_H, target_W), mode='bilinear', align_corners=False)
+    
+    # Dimension check after resizing
+    _, _, final_H, final_W = clean_images.shape
+    assert final_H == target_H and final_W == target_W, f"Dimension check failed: expected {target_H}x{target_W}, got {final_H}x{final_W}"
     
     # Normalize images to [0, 1] if they aren't already
     # Only check the first image to avoid expensive max operation
@@ -348,6 +355,14 @@ def train_epoch(
         dirty_images = batch['dirty_image'].to(device, non_blocking=True)  # Use non_blocking for async transfer
         clean_images = batch['clean_image'].to(device, non_blocking=True)
         
+        # Dimension check: ensure every batch has the expected dimensions
+        expected_height, expected_width = 1240, 877
+        _, _, h, w = dirty_images.shape
+        assert h == expected_height and w == expected_width, f"Training batch dimension mismatch: expected {expected_height}x{expected_width}, got {h}x{w}"
+        
+        _, _, h_clean, w_clean = clean_images.shape
+        assert h_clean == expected_height and w_clean == expected_width, f"Training batch dimension mismatch (clean): expected {expected_height}x{expected_width}, got {h_clean}x{w_clean}"
+        
         # Zero gradients
         optimizer.zero_grad(set_to_none=True)  # More efficient than False
         
@@ -428,6 +443,14 @@ def validate(
             # Get data
             dirty_images = batch['dirty_image'].to(device)
             clean_images = batch['clean_image'].to(device)
+            
+            # Dimension check: ensure every validation batch has the expected dimensions
+            expected_height, expected_width = 1240, 877
+            _, _, h, w = dirty_images.shape
+            assert h == expected_height and w == expected_width, f"Validation batch dimension mismatch: expected {expected_height}x{expected_width}, got {h}x{w}"
+            
+            _, _, h_clean, w_clean = clean_images.shape
+            assert h_clean == expected_height and w_clean == expected_width, f"Validation batch dimension mismatch (clean): expected {expected_height}x{expected_width}, got {h_clean}x{w_clean}"
             
             # Forward pass
             outputs = model(dirty_images)
@@ -822,13 +845,15 @@ def main():
     print("Loading a batch from the dataset...")
     batch = next(iter(train_loader))
     
-    # Extract images and get dimensions
+    # Extract images and get dimensions (after scaling in collate_fn)
     dirty_images = batch['dirty_image']
     _, _, height, width = dirty_images.shape
-    # Reduce resolution to half for faster training
-    height = height // 2
-    width = width // 2
-    print(f"Using reduced image dimensions: {height}x{width} (half resolution for faster training)")
+    
+    # Dimension check: ensure we have the expected target dimensions
+    expected_height, expected_width = 1240, 877
+    assert height == expected_height and width == expected_width, f"Dimension mismatch: expected {expected_height}x{expected_width}, got {height}x{width}"
+    
+    print(f"✓ Dimension check passed: {height}x{width} (target resolution for training)")
     
     # Initialize model
     if args.model_type == "autoencoder":
