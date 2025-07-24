@@ -14,11 +14,13 @@ import time
 import argparse
 import json
 import io
+import os
 from datetime import datetime
 
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from torch.cuda.amp import autocast, GradScaler
 from torch.utils.data import DataLoader
 import numpy as np
 import matplotlib.pyplot as plt
@@ -76,7 +78,7 @@ def load_dataset(data_root: Path, val_split: float = 0.1) -> Tuple[Dataset, Data
 
 
 def collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Union[torch.Tensor, List[Any]]]:
-    """Custom collate function to handle the conversion to tensors.
+    """Robust collate function that handles both numpy arrays and lists.
     
     Args:
         batch: List of dataset items
@@ -84,26 +86,56 @@ def collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Union[torch.Tensor, Lis
     Returns:
         Dictionary of batched tensors
     """
-    clean_images = torch.tensor(np.stack([item['clean_image'] for item in batch])).float()
-    dirty_images = torch.tensor(np.stack([item['dirty_image'] for item in batch])).float()
+    # Handle various input types (numpy arrays or lists) robustly
+    clean_images_list = []
+    dirty_images_list = []
+    
+    for item in batch:
+        # Handle clean images
+        clean_img = item['clean_image']
+        if isinstance(clean_img, np.ndarray):
+            clean_images_list.append(torch.from_numpy(clean_img).float())
+        elif isinstance(clean_img, list):
+            clean_images_list.append(torch.tensor(clean_img).float())
+        else:
+            # Already a tensor or another type
+            clean_images_list.append(torch.tensor(clean_img).float())
+            
+        # Handle dirty images
+        dirty_img = item['dirty_image']
+        if isinstance(dirty_img, np.ndarray):
+            dirty_images_list.append(torch.from_numpy(dirty_img).float())
+        elif isinstance(dirty_img, list):
+            dirty_images_list.append(torch.tensor(dirty_img).float())
+        else:
+            # Already a tensor or another type
+            dirty_images_list.append(torch.tensor(dirty_img).float())
+    
+    # Stack tensors
+    clean_images = torch.stack(clean_images_list)
+    dirty_images = torch.stack(dirty_images_list)
     
     # Normalize images to [0, 1] if they aren't already
-    if clean_images.max() > 1.0:
+    # Only check the first image to avoid expensive max operation
+    if clean_images[0].max() > 1.0:
         clean_images = clean_images / 255.0
-    if dirty_images.max() > 1.0:
+    if dirty_images[0].max() > 1.0:
         dirty_images = dirty_images / 255.0
         
+    # Pre-compute the dirt_type tensor
+    dirt_types = torch.tensor([item['dirt_type'] for item in batch])
+    
     return {
         'clean_image': clean_images,
         'dirty_image': dirty_images,
-        'dirt_type': torch.tensor([item['dirt_type'] for item in batch]),
+        'dirt_type': dirt_types,
         'clean_file': [item['clean_file'] for item in batch],
         'dirty_file': [item['dirty_file'] for item in batch]
     }
 
 
 def prepare_dataloader(dataset: Dataset, batch_size: int = 4, shuffle: bool = True) -> DataLoader:
-    """Prepare a DataLoader for the dataset.
+    """Prepare an optimized DataLoader for the dataset.
     
     Args:
         dataset: The dataset to load
@@ -111,16 +143,21 @@ def prepare_dataloader(dataset: Dataset, batch_size: int = 4, shuffle: bool = Tr
         shuffle: Whether to shuffle the dataset
         
     Returns:
-        DataLoader for the dataset
+        DataLoader for the dataset with optimized performance settings
     """
-    # Create the DataLoader
+    # Use more worker processes based on available CPU cores
+    num_workers = min(8, os.cpu_count() or 4)
+    
+    # Create the DataLoader with optimized settings
     dataloader = DataLoader(  # pyright: ignore[reportGeneralTypeIssues]
         dataset, 
         batch_size=batch_size, 
         shuffle=shuffle,
         collate_fn=collate_fn,
-        num_workers=2,
-        pin_memory=True
+        num_workers=num_workers,  # Increased worker count
+        pin_memory=True,
+        prefetch_factor=2,  # Prefetch 2 batches per worker
+        persistent_workers=True  # Keep workers alive between epochs
     )
     
     return dataloader
@@ -251,7 +288,7 @@ def train_epoch(
     log_interval: int = 10,
     log_to_wandb: bool = False
 ) -> float:
-    """Train the model for one epoch.
+    """Train the model for one epoch using mixed precision training.
     
     Args:
         model: The autoencoder model
@@ -261,6 +298,7 @@ def train_epoch(
         device: Device to run on
         epoch: Current epoch number
         log_interval: How often to log progress
+        log_to_wandb: Whether to log metrics to wandb
         
     Returns:
         Average training loss for the epoch
@@ -268,26 +306,46 @@ def train_epoch(
     model.train()
     total_loss = 0.0
     
+    # Initialize gradient scaler for mixed precision training
+    scaler = GradScaler() if device == 'cuda' else None
+    use_amp = device == 'cuda'  # Only use mixed precision on CUDA devices
+    
     # Use tqdm for progress bar
     pbar = tqdm(enumerate(train_loader), total=len(train_loader), desc=f"Epoch {epoch}")
     
     for batch_idx, batch in pbar:
         # Get data
-        dirty_images = batch['dirty_image'].to(device)
-        clean_images = batch['clean_image'].to(device)
+        dirty_images = batch['dirty_image'].to(device, non_blocking=True)  # Use non_blocking for async transfer
+        clean_images = batch['clean_image'].to(device, non_blocking=True)
         
         # Zero gradients
-        optimizer.zero_grad()
+        optimizer.zero_grad(set_to_none=True)  # More efficient than False
         
-        # Forward pass
-        outputs = model(dirty_images)
+        # Mixed precision training path
+        if use_amp:
+            with autocast():
+                # Forward pass
+                outputs = model(dirty_images)
+                
+                # Calculate loss
+                loss = criterion(outputs, clean_images)
+            
+            # Backward pass with gradient scaling
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
         
-        # Calculate loss
-        loss = criterion(outputs, clean_images)
-        
-        # Backward pass and optimize
-        loss.backward()
-        optimizer.step()
+        # Standard precision training path
+        else:
+            # Forward pass
+            outputs = model(dirty_images)
+            
+            # Calculate loss
+            loss = criterion(outputs, clean_images)
+            
+            # Backward pass and optimize
+            loss.backward()
+            optimizer.step()
         
         # Update total loss
         total_loss += loss.item()
