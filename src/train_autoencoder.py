@@ -130,7 +130,7 @@ def collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Union[torch.Tensor, Lis
     # Get current dimensions and check if resizing is needed
     _, _, H, W = clean_images.shape
     if H != target_H or W != target_W:
-        print(f"Resizing images from {H}x{W} to {target_H}x{target_W}")
+        #print(f"Resizing images from {H}x{W} to {target_H}x{target_W}")
         # Resize both clean and dirty images
         clean_images = F.interpolate(clean_images, size=(target_H, target_W), mode='bilinear', align_corners=False)
         dirty_images = F.interpolate(dirty_images, size=(target_H, target_W), mode='bilinear', align_corners=False)
