@@ -418,13 +418,13 @@ def validate(
     avg_loss = total_loss / len(val_loader)
     
     # Visualize results if path is provided
-    if visualize_path is not None and sample_input is not None:
-        visualize_batch(
-            sample_input.cpu(),
-            sample_output.cpu(),
-            sample_target.cpu(),
-            save_path=visualize_path
-        )
+    #if visualize_path is not None and sample_input is not None:
+     #   visualize_batch(
+      #      sample_input.cpu(),
+       #     sample_output.cpu(),
+        #    sample_target.cpu(),
+         #   save_path=visualize_path
+        #)
         
     # Log to wandb if enabled
     if log_to_wandb and sample_input is not None and epoch is not None:
@@ -639,15 +639,16 @@ def train_model(
         else:
             patience_counter += 1
         
-        # Save checkpoint
-        save_checkpoint(
-            model=model,
-            optimizer=optimizer,
-            epoch=epoch,
-            loss=val_loss,
-            checkpoint_dir=checkpoint_dir,
-            is_best=is_best
-        )
+        # # Save checkpoint
+        # if is_best:
+        #     save_checkpoint(
+        #     model=model,
+        #     optimizer=optimizer,
+        #     epoch=epoch,
+        #     loss=val_loss,
+        #     checkpoint_dir=checkpoint_dir,
+        #     is_best=is_best
+        # )
         
         # Early stopping
         if patience_counter >= early_stopping_patience:
@@ -663,17 +664,17 @@ def train_model(
         with open(log_dir / "training_history.json", 'w') as f:
             json.dump(history, f)
         
-        # Plot losses
-        plt.figure(figsize=(10, 5))
-        plt.plot(history['epochs'], history['train_losses'], label='Train Loss')
-        plt.plot(history['epochs'], history['val_losses'], label='Val Loss')
-        plt.xlabel('Epoch')
-        plt.ylabel('Loss')
-        plt.title('Training and Validation Loss')
-        plt.legend()
-        plt.grid(True)
-        plt.savefig(log_dir / "loss_plot.png")
-        plt.close()
+        # # Plot losses
+        # plt.figure(figsize=(10, 5))
+        # plt.plot(history['epochs'], history['train_losses'], label='Train Loss')
+        # plt.plot(history['epochs'], history['val_losses'], label='Val Loss')
+        # plt.xlabel('Epoch')
+        # plt.ylabel('Loss')
+        # plt.title('Training and Validation Loss')
+        # plt.legend()
+        # plt.grid(True)
+        # plt.savefig(log_dir / "loss_plot.png")
+        # plt.close()
     
     # Calculate training time
     total_time = time.time() - start_time
