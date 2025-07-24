@@ -123,8 +123,9 @@ def collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Union[torch.Tensor, Lis
     # Resize images to target dimensions for training
     import torch.nn.functional as F
     
-    # Target dimensions (half of original 2480x1754)
-    target_H, target_W = 1240, 877
+    # Target dimensions - REDUCED for memory efficiency
+    # Original: 1240x877, reduced by ~50% to fit in available VRAM
+    target_H, target_W = 620, 438
     
     # Get current dimensions and check if resizing is needed
     _, _, H, W = clean_images.shape
@@ -223,10 +224,10 @@ def initialize_model(
             img_size=(input_height, input_width),  # Use actual rectangular dimensions
             in_chans=3,  # RGB images (3 channels)
             out_chans=3,  # RGB output (3 channels)
-            window_size=8,  # Standard window size
-            embed_dim=96,  # Embedding dimension
-            depths=[6, 6, 6, 6],  # Default depths for moderate-sized model
-            num_heads=[6, 6, 6, 6],  # Default number of heads
+            window_size=7,  # Smaller window size to reduce memory
+            embed_dim=48,  # Reduced embedding dimension (was 96)
+            depths=[2, 2, 2, 2],  # Fewer layers to reduce memory
+            num_heads=[3, 3, 3, 3],  # Fewer attention heads
             use_checkpoint=True  # Use checkpointing to save memory
         )
     else:
@@ -356,7 +357,8 @@ def train_epoch(
         clean_images = batch['clean_image'].to(device, non_blocking=True)
         
         # Dimension check: ensure every batch has the expected dimensions
-        expected_height, expected_width = 1240, 877
+        # Using reduced resolution to fit in available VRAM
+        expected_height, expected_width = 620, 438
         _, _, h, w = dirty_images.shape
         assert h == expected_height and w == expected_width, f"Training batch dimension mismatch: expected {expected_height}x{expected_width}, got {h}x{w}"
         
@@ -444,8 +446,9 @@ def validate(
             dirty_images = batch['dirty_image'].to(device)
             clean_images = batch['clean_image'].to(device)
             
-            # Dimension check: ensure every validation batch has the expected dimensions
-            expected_height, expected_width = 1240, 877
+            # Dimension check: ensure every batch has the expected dimensions
+            # Using reduced resolution to fit in available VRAM
+            expected_height, expected_width = 620, 438
             _, _, h, w = dirty_images.shape
             assert h == expected_height and w == expected_width, f"Validation batch dimension mismatch: expected {expected_height}x{expected_width}, got {h}x{w}"
             
@@ -850,7 +853,11 @@ def main():
     _, _, height, width = dirty_images.shape
     
     # Dimension check: ensure we have the expected target dimensions
-    expected_height, expected_width = 1240, 877
+    # TEMPORARY: Using smaller resolution to fit in available VRAM (15.72 GB)
+    # Original target: 1240x877, reduced by ~50% for memory efficiency
+    expected_height, expected_width = 620, 438  # Roughly half the original size
+    print(f"⚠️  USING REDUCED RESOLUTION: {expected_height}x{expected_width} (original: 1240x877)")
+    print(f"   This is temporary to fit in available VRAM. Consider upgrading to 24GB+ GPU for full resolution.")
     assert height == expected_height and width == expected_width, f"Dimension mismatch: expected {expected_height}x{expected_width}, got {height}x{width}"
     
     print(f"✓ Dimension check passed: {height}x{width} (target resolution for training)")
