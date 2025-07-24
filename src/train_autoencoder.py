@@ -120,6 +120,17 @@ def collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Union[torch.Tensor, Lis
     clean_images = torch.stack(clean_images_list)
     dirty_images = torch.stack(dirty_images_list)
     
+    # Resize images to half resolution for faster training
+    import torch.nn.functional as F
+    
+    # Get current dimensions
+    _, _, H, W = clean_images.shape
+    target_H, target_W = H // 2, W // 2
+    
+    # Resize both clean and dirty images
+    clean_images = F.interpolate(clean_images, size=(target_H, target_W), mode='bilinear', align_corners=False)
+    dirty_images = F.interpolate(dirty_images, size=(target_H, target_W), mode='bilinear', align_corners=False)
+    
     # Normalize images to [0, 1] if they aren't already
     # Only check the first image to avoid expensive max operation
     if clean_images[0].max() > 1.0:
@@ -814,7 +825,10 @@ def main():
     # Extract images and get dimensions
     dirty_images = batch['dirty_image']
     _, _, height, width = dirty_images.shape
-    print(f"Using actual image dimensions: {height}x{width}")
+    # Reduce resolution to half for faster training
+    height = height // 2
+    width = width // 2
+    print(f"Using reduced image dimensions: {height}x{width} (half resolution for faster training)")
     
     # Initialize model
     if args.model_type == "autoencoder":
