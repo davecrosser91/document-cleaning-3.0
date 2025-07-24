@@ -712,7 +712,22 @@ class RSTB(nn.Module):
         Returns:
             Output tensor with shape (B, H*W, C)
         """
-        return x + self.patch_embed(self.conv(self.patch_unembed(self.residual_group(x), x_size))).flatten(2).transpose(1, 2)
+        # Process through residual group
+        residual_out = self.residual_group(x)
+        
+        # Convert to spatial representation for conv processing
+        spatial_tensor = self.patch_unembed(residual_out, x_size)  # (B, C, H, W)
+        
+        # Apply convolution
+        conv_out = self.conv(spatial_tensor)  # (B, C, H, W)
+        
+        # Convert back to sequence representation
+        # Use the actual spatial dimensions from x_size instead of the configured img_size
+        B, C, H, W = conv_out.shape
+        sequence_out = conv_out.flatten(2).transpose(1, 2)  # (B, H*W, C)
+        
+        # Add residual connection
+        return x + sequence_out
 
 
 class SwinIR(nn.Module):
