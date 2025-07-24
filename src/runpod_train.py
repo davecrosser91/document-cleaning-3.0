@@ -7,9 +7,11 @@ This script provides utilities to launch and manage training jobs on RunPod.
 import argparse
 import json
 import os
-import subprocess
+import re
 import sys
+import subprocess
 import time
+import tempfile
 from pathlib import Path
 from typing import Dict, List, Optional, Union, Any
 from dotenv import load_dotenv
@@ -341,39 +343,77 @@ class RunpodTrainer:
         
         print(f"Installing requirements on pod {self.pod_id}...")
         
-        # Install basic requirements
-        cmd = [
-            "runpodctl", 
-            "exec", 
-            "pod", 
-            self.pod_id, 
-            "--", 
-            "pip", 
-            "install", 
-            "torch", 
-            "torchvision", 
-            "datasets", 
-            "matplotlib", 
-            "tqdm", 
-            "pydantic", 
-            "wandb"
-        ]
-        subprocess.run(cmd, check=True)
+        # Create a temporary script to run installation commands
+        with tempfile.NamedTemporaryFile(suffix=".py", delete=False) as tmp_file:
+            install_script = """
+import subprocess
+import sys
+
+print("Installing basic ML requirements...")
+try:
+    subprocess.run(["pip", "install", "torch", "torchvision", "datasets", "matplotlib", "tqdm", "pydantic", "wandb"], 
+                   check=True, capture_output=True, text=True)
+    
+    print("Checking for requirements.txt...")
+    # Check if requirements.txt exists and install from it
+    import os
+    if os.path.exists("/workspace/requirements.txt"):
+        subprocess.run(["pip", "install", "-r", "/workspace/requirements.txt"], 
+                      check=True, capture_output=True, text=True)
+        print("Installed dependencies from requirements.txt")
+    
+    # Install package in development mode if pyproject.toml exists
+    if os.path.exists("/workspace/pyproject.toml"):
+        subprocess.run(["pip", "install", "-e", "."], 
+                      cwd="/workspace", check=True, capture_output=True, text=True)
+        print("Installed package in development mode")
+    
+    print("All requirements installed successfully")
+    sys.exit(0)
+except Exception as e:
+    print(f"Error installing requirements: {str(e)}")
+    sys.exit(1)
+"""
+            tmp_file.write(install_script.encode())
+            tmp_file.flush()
+            tmp_path = tmp_file.name
         
-        # If there's a requirements.txt file, install from that
-        cmd = [
-            "runpodctl", 
-            "exec", 
-            "pod", 
-            self.pod_id, 
-            "--", 
-            "bash", 
-            "-c", 
-            "if [ -f /workspace/requirements.txt ]; then pip install -r /workspace/requirements.txt; fi"
-        ]
-        subprocess.run(cmd, check=True)
-        
-        return True
+        try:
+            print("Running installation script on pod...")
+            cmd = [
+                "runpodctl", 
+                "exec", 
+                "python",
+                tmp_path,
+                "--pod_id",
+                self.pod_id
+            ]
+            
+            # Execute the installation script
+            result = subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=300)
+            if result.stdout:
+                print(result.stdout)
+            
+            print("Successfully installed all requirements")
+            return True
+            
+        except subprocess.CalledProcessError as e:
+            print(f"Error installing requirements: {e}")
+            if hasattr(e, 'stdout') and e.stdout:
+                print(f"OUTPUT: {e.stdout}")
+            if hasattr(e, 'stderr') and e.stderr:
+                print(f"ERROR: {e.stderr}")
+            return False
+        except subprocess.TimeoutExpired:
+            print("Error: Command timed out while installing requirements")
+            return False
+        except Exception as e:
+            print(f"Unexpected error installing requirements: {e}")
+            return False
+        finally:
+            # Clean up the temporary script
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
     
     def start_training(
         self, 
@@ -396,60 +436,147 @@ class RunpodTrainer:
         if not self.pod_id:
             raise ValueError("No pod ID available")
         
-        args = args or []
+        print(f"Starting training on pod {self.pod_id}...")
         
-        # Prepare environment variables
-        env_vars = []
+        # Prepare arguments and environment variables
+        args = args or []
+        train_args = []
+        
         if use_wandb:
+            train_args.append("--wandb")
             wandb_api_key = wandb_api_key or os.environ.get("WANDB_API_KEY")
             if wandb_api_key:
-                env_vars.append(f"WANDB_API_KEY={wandb_api_key}")
+                train_args.append(f"--wandb-key {wandb_api_key}")
         
-        env_str = " ".join(env_vars)
+        # Add any additional arguments
+        train_args.extend(args)
         
-        # Construct command
-        cmd_parts = ["cd /workspace && python", script_path] + args
-        cmd_str = " ".join(cmd_parts)
+        # Create a temporary script that will run the training
+        with tempfile.NamedTemporaryFile(suffix=".py", delete=False) as tmp_file:
+            train_launcher_script = f"""
+import subprocess
+import sys
+import os
+import time
+
+print("Starting training script execution...")
+
+try:
+    # Change to workspace directory
+    os.chdir("/workspace")
+    
+    # Build command
+    cmd = ["python", "{script_path}"] + {train_args}
+    
+    print(f"Running command: {{' '.join(cmd)}}")
+    
+    # Run the training script and stream output
+    process = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1
+    )
+    
+    # Print output in real-time
+    for line in process.stdout:
+        print(line, end="")
         
-        if env_str:
-            cmd_str = f"{env_str} {cmd_str}"
-        
-        print(f"Starting training on pod {self.pod_id}...")
-        print(f"Command: {cmd_str}")
-        
-        cmd = [
-            "runpodctl", 
-            "exec", 
-            "pod", 
-            self.pod_id, 
-            "--", 
-            "bash", 
-            "-c", 
-            cmd_str
-        ]
-        
-        # Start the process
-        process = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
-        )
-        
-        # Print output in real-time
-        print("Training started. Output:")
-        print("-" * 50)
-        
+    # Wait for process to complete
+    returncode = process.wait()
+    if returncode != 0:
+        print(f"Training exited with non-zero return code: {{returncode}}")
+        sys.exit(returncode)
+    
+    print("Training completed successfully!")
+    sys.exit(0)
+    
+except Exception as e:
+    print(f"Error executing training: {{str(e)}}")
+    sys.exit(1)
+"""
+            tmp_file.write(train_launcher_script.encode())
+            tmp_file.flush()
+            tmp_path = tmp_file.name
+    
         try:
-            for line in process.stdout:
-                print(line, end="")
-        except KeyboardInterrupt:
-            print("\nInterrupted by user. Training continues on RunPod.")
-            print("You can check the status later with:")
-            print(f"runpodctl exec pod {self.pod_id} -- tail -f /workspace/training.log")
-        
-        return self.pod_id
+            # Execute the training script on the pod
+            print(f"Executing training script {script_path} on pod {self.pod_id}...")
+            cmd = [
+                "runpodctl", 
+                "exec", 
+                "python",
+                tmp_path,
+                "--pod_id",
+                self.pod_id
+            ]
+            
+            # Start the process and stream output
+            process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+            )
+            
+            # Print output in real-time
+            print("\nTraining started. Output:")
+            print("-" * 50)
+            
+            # Set up timeout for SSH connection
+            start_time = time.time()
+            timeout = 60  # 60 seconds timeout for SSH connection
+            waiting_for_connection = True
+            connection_message_shown = False
+            
+            try:
+                for line in process.stdout:
+                    # Check for SSH connection message
+                    if "Waiting for Pod to come online" in line and waiting_for_connection:
+                        if not connection_message_shown:
+                            print("Attempting to establish SSH connection to the pod...")
+                            print("This may take a minute, especially on newly started pods.")
+                            connection_message_shown = True
+                        
+                        # Check for timeout
+                        if time.time() - start_time > timeout:
+                            print("SSH connection timed out. The pod might be unreachable or still initializing.")
+                            print("Consider checking pod status or trying again in a few minutes.")
+                            raise TimeoutError("SSH connection timed out")
+                    elif line.strip() and waiting_for_connection:
+                        # We got some output, so connection is established
+                        waiting_for_connection = False
+                        
+                    print(line, end="")
+                
+                return self.pod_id
+                
+            except KeyboardInterrupt:
+                print("\nInterrupted by user. Training continues on RunPod.")
+                print("You can check the status later with the RunPod console.")
+                return self.pod_id
+                
+            except Exception as e:
+                print(f"Error starting training: {e}")
+                
+                # Provide manual instructions as fallback
+                cmd_str = f"cd /workspace && python {script_path} {' '.join(train_args)}"
+                
+                print(f"\n{'=' * 80}")
+                print(f"MANUAL TRAINING INSTRUCTIONS FOR POD {self.pod_id}")
+                print(f"{'=' * 80}")
+                print("\nAn error occurred while trying to start training remotely.")
+                print("Please connect to your pod via SSH or Web Terminal and run:")
+                print("\n    " + cmd_str)
+                print(f"{'=' * 80}\n")
+                
+                return self.pod_id
+        finally:
+            # Clean up the temporary script
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
     
     def stop_pod(self) -> bool:
         """Stop the pod.

@@ -139,8 +139,11 @@ class PairedPDFBuilder(datasets.GeneratorBasedBuilder):
 
     def _generate_examples(self, **kwargs) -> Iterable[Tuple[int, Dict]]:
         data_root = kwargs.get('data_root')
-        if not isinstance(data_root, Path):
-            raise ValueError(f"Expected data_root to be a Path object, got {type(data_root)}")
+        # Check if it's path-like (has __truediv__ for / operator)
+        if not hasattr(data_root, '__truediv__'):
+            raise ValueError(f"Expected data_root to be a path-like object with / operator, got {type(data_root)}")
+        # Convert to Path object if it's not already
+        data_root = Path(data_root) if not isinstance(data_root, Path) else data_root
         clean_dir, dirty_dir = data_root / _CLEAN_DIR, data_root / _DIRTY_DIR
         clean_basenames = {p.stem for p in clean_dir.glob("*.pdf")}
 
