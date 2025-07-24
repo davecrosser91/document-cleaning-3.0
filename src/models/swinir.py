@@ -690,7 +690,7 @@ class RSTB(nn.Module):
         self.patch_embed = PatchEmbed(
             img_size=img_size, 
             patch_size=patch_size, 
-            in_chans=0, 
+            in_chans=dim, 
             embed_dim=dim,
             norm_layer=None
         )
@@ -745,6 +745,14 @@ class SwinIR(nn.Module):
             in_chans=config.embed_dim, 
             embed_dim=config.embed_dim,
             norm_layer=nn.LayerNorm if self.patch_norm else None
+        )
+        
+        # Patch unembedding for converting back to spatial representation
+        self.patch_unembed = PatchUnEmbed(
+            img_size=(config.img_height, config.img_width),
+            patch_size=config.patch_size,
+            in_chans=0,
+            embed_dim=config.embed_dim
         )
         
         num_patches = self.patch_embed.num_patches
@@ -862,7 +870,7 @@ class SwinIR(nn.Module):
             x = layer(x, x_size)
         
         x = self.norm(x)  # B, L, C
-        x = self.patch_embed.patch_unembed(x, x_size)  # B, C, H, W
+        x = self.patch_unembed(x, x_size)  # B, C, H, W
         
         return x
     
